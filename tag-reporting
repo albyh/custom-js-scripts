@@ -1,0 +1,411 @@
+// Alby.js
+// Fast DV index path, Advanced-URI jump-to-line, flicker-free
+// - Column 1: exact raw line (so tags render natively)
+// - Column 2: link to file that jumps to the exact line (uses Advanced URI if installed)
+// - Column 3: note name as a link
+// - Excludes completed tasks
+// - Adds one "note" row if frontmatter tags include the filter tag
+//
+// Usage from a note (example):
+// ```
+// await dv.view(".obsidian/snippets/Alby", { tagName: dv.current().reportTag || "PROJECT", scanParagraphs: true })
+// ```
+
+module.exports = async (dv, input) => {
+  /********* CONFIG (overridable via input) *********/
+  const TAG_NAME = (input?.tagName ?? dv.current().reportTag ?? "PROJECT").trim();
+  const POS_MODE = "line";                        // kept for compatibility if you ever re-enable position
+  const SCAN_PARAGRAPHS = Boolean(input?.scanParagraphs ?? true);
+  const MAX_CONCURRENCY = Number(input?.maxConcurrency ?? 12);
+  /**************************************************/
+
+  // ---------- Helpers ----------
+  const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // match #TAG or #TAG/sub (case-insensitive)
+  const tagRe = new RegExp(`(^|\\s)#${esc(TAG_NAME)}(?:\\b|/)`, "i");
+
+  function cleanSortKey(text) {
+    return String(text ?? "")
+      .replace(/(^|\s)#[\w/-]+/g, " ")
+      .replace(/^[^\w\d]+/, "")
+      .replace(/[^\w\d]+/g, " ")
+      .trim()
+      .toLowerCase();
+  }
+
+  function buildAdvancedUri(path, line) {
+    const vault = encodeURIComponent(app.vault.getName() || "");
+    const filepath = encodeURIComponent(path);
+    return `obsidian://advanced-uri?vault=${vault}&filepath=${filepath}&line=${line}&openmode=current`;
+  }
+
+  async function mapLimit(items, limit, worker) {
+    const out = new Array(items.length);
+    let i = 0, active = 0;
+    return await new Promise((resolve, reject) => {
+      const next = () => {
+        if (i >= items.length && active === 0) return resolve(out);
+        while (active < limit && i < items.length) {
+          const idx = i++;
+          active++;
+          Promise.resolve(worker(items[idx], idx))
+            .then(res => { out[idx] = res; active--; next(); })
+            .catch(err => reject(err));
+        }
+      };
+      next();
+    });
+  }
+
+  // Basic line detectors (string-level)
+  const isTaskLine = s => /^\s*[-*+]\s\[[ xX]\]\s/.test(s);
+  const isCompletedTaskLine = s => /^\s*[-*+]\s\[[xX]\]\s/.test(s);
+  const isListLine = s => /^\s*(?:-|\*|\+|\d+\.)\s/.test(s);
+
+  // Frontmatter “tags” helpers (for note rows)
+  function fmTagsFromDvPage(p) {
+    const fm = p?.file?.frontmatter;
+    if (!fm) return [];
+    const raw = Array.isArray(fm.tags) ? fm.tags : (fm.tags != null ? [fm.tags] : []);
+    return raw.map(s => String(s ?? "").toLowerCase().replace(/^#/, ""));
+  }
+  function hasFrontmatterTag_DV(p) {
+    const want = TAG_NAME.toLowerCase();
+    return fmTagsFromDvPage(p).some(t => t === want || t.startsWith(`${want}/`));
+  }
+  function fmHasTagInCache(cache) {
+    const want = TAG_NAME.toLowerCase();
+    const fmTags = Array.isArray(cache?.frontmatter?.tags)
+      ? cache.frontmatter.tags
+      : (cache?.frontmatter?.tags != null ? [cache.frontmatter.tags] : []);
+    return fmTags
+      .map(String)
+      .map(t => t.toLowerCase().replace(/^#/, ""))
+      .some(t => t === want || t.startsWith(`${want}/`));
+  }
+
+  // ---------- UI container ----------
+  const outer = dv.container;
+  outer.classList.add("callout", "is-collapsible");
+  outer.setAttribute("data-callout", "note");
+  outer.replaceChildren();
+
+  const title = outer.createEl("div", { cls: "callout-title" });
+  title.createEl("div", { cls: "callout-icon" });
+  title.createEl("div", { text: `Report Tag: ${TAG_NAME}`, cls: "callout-title-inner" });
+  const contentContainer = outer.createEl("div", { cls: "callout-content" });
+
+  // Flicker-free swap
+  function swapIn(renderFn) {
+    const prevH = contentContainer.offsetHeight;
+    if (prevH) contentContainer.style.minHeight = prevH + "px";
+    const temp = document.createElement("div");
+    renderFn(temp);
+    const frag = document.createDocumentFragment();
+    while (temp.firstChild) frag.appendChild(temp.firstChild);
+    contentContainer.replaceChildren(frag);
+    requestAnimationFrame(() => { contentContainer.style.minHeight = ""; });
+  }
+
+  // ---------- Data pipeline ----------
+  let pathUsed = "dataview-index";
+  let allPages = dv.pages().where(p => p?.file?.extension === "md").array();
+
+  if (!allPages.length) {
+    pathUsed = "metadata-cache-fallback";
+  }
+
+  const rows = [];
+  let debug = { path: pathUsed, scanned: 0, candidates: 0, matchedPages: 0, tasks: 0, list: 0, lines: 0, notes: 0 };
+
+  if (pathUsed === "dataview-index") {
+    debug.scanned = allPages.length;
+
+    // Choose candidates without loading files:
+    const wanted = TAG_NAME.toLowerCase();
+    const hasMetaTag = p => {
+      const tags = [
+        ...(Array.isArray(p?.file?.tags) ? p.file.tags : []),
+        ...(Array.isArray(p?.file?.etags) ? p.file.etags : []),
+      ].map(s => String(s ?? "").toLowerCase().replace(/^#/, ""));
+      return tags.some(t => t === wanted || t.startsWith(`${wanted}/`));
+    };
+    const hasTaggedTask = p =>
+      Array.isArray(p?.file?.tasks) &&
+      p.file.tasks.some(t => !t.completed && tagRe.test(String(t.text ?? "")));
+    const hasTaggedList = p =>
+      Array.isArray(p?.file?.lists) &&
+      p.file.lists.some(li => !li.task && (
+        (Array.isArray(li.tags) && li.tags.some(s => tagRe.test(String(s ?? "")))) ||
+        tagRe.test(String(li.text ?? ""))
+      ));
+
+    const candidates = allPages.filter(p => hasMetaTag(p) || hasTaggedTask(p) || hasTaggedList(p));
+    debug.candidates = candidates.length;
+
+    for (const page of candidates) {
+      const path = page.file.path;
+      const fileName = page.file.name;
+      const pageRows = [];
+
+      // Optional file load once per page if we need paragraph lines or percent
+      let lines = [];
+      if (SCAN_PARAGRAPHS || POS_MODE === "percent") {
+        try {
+          const txt = await dv.io.load(path);
+          lines = typeof txt === "string" ? txt.split("\n") : [];
+        } catch { lines = []; }
+      }
+
+      // Tasks (exclude completed). Column 1 = raw task text
+      if (Array.isArray(page.file.tasks)) {
+        for (const t of page.file.tasks) {
+          if (t.completed) continue;
+          const text = String(t.text ?? "");
+          if (!tagRe.test(text)) continue;
+          const lineNum = (typeof t.line === "number" ? t.line : 0) + 1;
+
+          pageRows.push({
+            content: text,
+            type: "task",
+            path,
+            fileName,
+            line: lineNum,
+            position: POS_MODE === "percent" && lines.length
+              ? Math.round((lineNum / lines.length) * 100)
+              : (POS_MODE === "line" ? lineNum : null),
+            sortKey: cleanSortKey(text)
+          });
+        }
+      }
+      debug.tasks += pageRows.filter(r => r.type === "task").length;
+
+      // Non-task list items
+      if (Array.isArray(page.file.lists)) {
+        for (const li of page.file.lists) {
+          if (li.task) continue;
+          const text = String(li.text ?? "");
+          const tagged = (Array.isArray(li.tags) && li.tags.some(s => tagRe.test(String(s ?? "")))) || tagRe.test(text);
+          if (!tagged) continue;
+          const lineNum = (typeof li.line === "number" ? li.line : 0) + 1;
+
+          pageRows.push({
+            content: text,
+            type: "list item",              // will render as "list" in column 2
+            path,
+            fileName,
+            line: lineNum,
+            position: POS_MODE === "percent" && lines.length
+              ? Math.round((lineNum / lines.length) * 100)
+              : (POS_MODE === "line" ? lineNum : null),
+            sortKey: cleanSortKey(text)
+          });
+        }
+      }
+      debug.list += pageRows.filter(r => r.type === "list item").length;
+
+      // Paragraph lines (single-line render)
+      if (SCAN_PARAGRAPHS && lines.length) {
+        lines.forEach((line, idx) => {
+          const trimmed = String(line ?? "").trim();
+          const isListOrTask = /^\s*(?:-|\*|\+|\d+\.)\s|^\s*[-*]\s\[[ xX]\]\s/.test(trimmed);
+          if (!trimmed || isListOrTask) return;
+          if (!tagRe.test(trimmed)) return;
+          const lineNum = idx + 1;
+
+          pageRows.push({
+            content: trimmed,
+            type: "line",
+            path,
+            fileName,
+            line: lineNum,
+            position: POS_MODE === "percent"
+              ? Math.round((lineNum / lines.length) * 100)
+              : lineNum,
+            sortKey: cleanSortKey(trimmed)
+          });
+        });
+      }
+      debug.lines += pageRows.filter(r => r.type === "line").length;
+
+      // Add one "note" row when FRONTMATTER tags include the filter tag
+      if (hasFrontmatterTag_DV(page)) {
+        pageRows.push({
+          content: fileName,
+          type: "note",
+          path,
+          fileName,
+          line: null,
+          position: null,
+          sortKey: cleanSortKey(fileName)
+        });
+        debug.notes += 1;
+      }
+
+      if (pageRows.length) debug.matchedPages++;
+      rows.push(...pageRows);
+    }
+  } else {
+    // -------- Fallback: metadata cache path --------
+    const files = app.vault.getMarkdownFiles();
+    debug.scanned = files.length;
+
+    const candidates = files.filter(f => {
+      const cache = app.metadataCache.getFileCache(f);
+      if (!cache) return false;
+      const fmTags = Array.isArray(cache.frontmatter?.tags)
+        ? cache.frontmatter.tags
+        : (cache.frontmatter?.tags != null ? [cache.frontmatter.tags] : []);
+      const all = [
+        ...(Array.isArray(cache.tags) ? cache.tags.map(t => String(t.tag ?? "")) : []),
+        ...fmTags.map(String),
+      ];
+      const want = TAG_NAME.toLowerCase();
+      return all.some(t => {
+        const norm = t.toLowerCase().replace(/^#/, "");
+        return norm === want || norm.startsWith(`${want}/`);
+      });
+    });
+    debug.candidates = candidates.length;
+
+    await mapLimit(candidates, MAX_CONCURRENCY, async (file) => {
+      const path = file.path;
+      const fileName = file.basename;
+      const cache = app.metadataCache.getFileCache(file);
+      const text = await app.vault.cachedRead(file);
+      const lines = text.split("\n");
+
+      // Note row if frontmatter matches
+      if (fmHasTagInCache(cache)) {
+        rows.push({
+          content: fileName,
+          type: "note",
+          path,
+          fileName,
+          line: null,
+          position: null,
+          sortKey: cleanSortKey(fileName)
+        });
+        debug.notes += 1;
+      }
+
+      let matchedPage = false;
+      for (let idx = 0; idx < lines.length; idx++) {
+        const raw = String(lines[idx] ?? "");
+        const trimmed = raw.trim();
+        if (!trimmed) continue;
+
+        if (isTaskLine(trimmed)) {
+          if (isCompletedTaskLine(trimmed)) continue;
+          if (!tagRe.test(trimmed)) continue;
+          const lineNum = idx + 1;
+          const content = trimmed.replace(/^\s*[-*+]\s\[[ xX]\]\s/, ""); // DV-like task.text
+          rows.push({
+            content,
+            type: "task",
+            path,
+            fileName,
+            line: lineNum,
+            position: POS_MODE === "percent" ? Math.round((lineNum / lines.length) * 100) : lineNum,
+            sortKey: cleanSortKey(content)
+          });
+          matchedPage = true;
+          continue;
+        }
+
+        if (isListLine(trimmed) && tagRe.test(trimmed)) {
+          const lineNum = idx + 1;
+          const content = trimmed.replace(/^\s*(?:-|\*|\+|\d+\.)\s/, "");
+          rows.push({
+            content,
+            type: "list item",
+            path,
+            fileName,
+            line: lineNum,
+            position: POS_MODE === "percent" ? Math.round((lineNum / lines.length) * 100) : lineNum,
+            sortKey: cleanSortKey(content)
+          });
+          matchedPage = true;
+          continue;
+        }
+
+        if (SCAN_PARAGRAPHS && !isListLine(trimmed) && tagRe.test(trimmed)) {
+          const lineNum = idx + 1;
+          rows.push({
+            content: trimmed,
+            type: "line",
+            path,
+            fileName,
+            line: lineNum,
+            position: POS_MODE === "percent" ? Math.round((lineNum / lines.length) * 100) : lineNum,
+            sortKey: cleanSortKey(trimmed)
+          });
+          matchedPage = true;
+        }
+      }
+
+      if (matchedPage || fmHasTagInCache(cache)) debug.matchedPages++;
+    });
+
+    debug.tasks = rows.filter(r => r.type === "task").length;
+    debug.list  = rows.filter(r => r.type === "list item").length;
+    debug.lines = rows.filter(r => r.type === "line").length;
+  }
+
+  // ---------- Sort ----------
+  rows.sort((a, b) => {
+    const k = (a.sortKey || "").localeCompare(b.sortKey || ""); if (k) return k;
+    const t = (a.type || "").localeCompare(b.type || "");       if (t) return t;
+    const f = (a.path || "").localeCompare(b.path || "");       if (f) return f;
+    return (a.position ?? 0) - (b.position ?? 0);
+  });
+
+  // ---------- Render ----------
+  swapIn((temp) => {
+    // Dashboard
+    const d = document.createElement("div");
+    d.style.fontSize = "0.9em";
+    d.style.opacity = "0.8";
+    d.textContent =
+      `Path: ${debug.path} | Scanned: ${debug.scanned} | Candidates: ${debug.candidates} | ` +
+      `Matched pages: ${debug.matchedPages} | Tasks: ${debug.tasks} | List: ${debug.list} | Lines: ${debug.lines}` +
+      (debug.notes ? ` | Notes: ${debug.notes}` : "");
+    temp.appendChild(d);
+
+    if (!rows.length) {
+      const p = document.createElement("p");
+      p.textContent = `No items found with the tag #${TAG_NAME}.`;
+      temp.appendChild(p);
+      return;
+    }
+
+    const hasAdvURI = !!app?.plugins?.plugins?.["obsidian-advanced-uri"];
+
+    // Three-column table: Item | Type | Note
+    dv.table(
+      ["Item", "Type", "Note"],
+      rows.map(r => {
+        const col1 = r.content; // exact raw line or file name
+
+        // Column 2: Type link (jump to line when available); shorten "list item" -> "list"
+        const typeLabel = (r.type === "list item") ? "list" : r.type;
+        let col2;
+        if (hasAdvURI && typeof r.line === "number" && r.line > 0) {
+          const a = document.createElement("a");
+          a.href = buildAdvancedUri(r.path, r.line);
+          a.textContent = typeLabel;
+          a.rel = "noopener";
+          col2 = a;
+        } else {
+          col2 = dv.fileLink(r.path, false, typeLabel);
+        }
+
+        // Column 3: Note name as a link
+        const col3 = dv.fileLink(r.path, false, r.fileName || "note");
+
+        return [col1, col2, col3];
+      }),
+      temp
+    );
+  });
+};
